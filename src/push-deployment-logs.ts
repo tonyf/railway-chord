@@ -2,6 +2,10 @@ import subscribeToDeploymentLogs from '@/api/websocket/subscribe-to-deployment-l
 import { App, VectorProcess } from '@/types'
 import write from '@/vector/write'
 import { Client as GqlWsClient } from 'graphql-ws'
+import sleep from '@/utils/sleep'
+
+const MAX_RETRIES = 30
+const RETRY_BACKOFF_MS = 3000
 
 /**
  * Opens a subscription to Railway's deployment logs API, and pushes the
@@ -11,30 +15,49 @@ const pushDeploymentLogs = async (
   wsClient: GqlWsClient,
   vector: VectorProcess,
   deployment: App.Deployment,
+  loopStart: Date,
+  maxRetries = MAX_RETRIES,
 ) => {
+  if (maxRetries <= 0) {
+    console.error(`Max retries exceeded on pushDeploymentLogs, crashing!`)
+    process.exit(1)
+  }
   try {
     for await (const result of subscribeToDeploymentLogs(
       wsClient,
       deployment.id,
     )) {
       result.data?.deploymentLogs.forEach((log) => {
+        const { message, severity, timestamp } = log
+
+        // This hacks around Railway's API returning ALL logs at start of
+        // stream by only pushing logs from when our event loop starts
+        if (loopStart > new Date(timestamp)) {
+          return
+        }
+
+        console.log('💓')
+
         const out = {
+          message,
+          severity,
+          timestamp,
           railway: {
             type: 'DEPLOYMENT',
-            name: deployment.staticUrl,
-            id: deployment.id,
-            environment: deployment.environmentName,
+            ...log.tags,
+            deploymentUrl: deployment.staticUrl,
+            environmentName: deployment.environmentName,
           },
-          ...log,
         }
+
         write(vector, JSON.stringify(out))
+        maxRetries = MAX_RETRIES
       })
     }
   } catch (e) {
-    // @TODO This needs some re-try logic. If there's a momentary API error,
-    // this will crash the service (intentional for now).
-    console.error('Error reading deployment logs', e)
-    process.exit(1)
+    console.error(`Retrying error in pushDeploymentLogs`, e)
+    await sleep(RETRY_BACKOFF_MS)
+    pushDeploymentLogs(wsClient, vector, deployment, loopStart, maxRetries - 1)
   }
 }
 
